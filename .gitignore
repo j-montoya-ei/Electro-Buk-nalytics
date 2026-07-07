@@ -1,0 +1,46 @@
+﻿# Secretos - CRITICO
+.env
+.env.local
+*.key
+*.pem
+
+# Entorno virtual
+.venv/
+venv/
+
+# Python compilado
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs y temporales
+logs/
+*.log
+tmp/
+
+# Base de datos local (SQLite viejo)
+data/*.db
+data/*.sqlite
+
+# Power BI
+*.pbix
+*.pbit
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+
+# Archivos vacios residuales del proyecto viejo
+asistencia.py
+empelados.py
+script
+ejecutar_reporte.bat
+test.validar.py
+main.py
