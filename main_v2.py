@@ -108,7 +108,19 @@ def http_get_con_retry(url, headers, params=None):
             if 200 <= r.status_code < 300:
                 return r
 
-            # 4xx = error del cliente, no tiene sentido reintentar
+            # 429 (rate limit) y 408 (timeout) SÍ se reintentan (respetando Retry-After)
+            if r.status_code in (429, 408):
+                retry_after = r.headers.get("Retry-After")
+                espera_forzada = int(retry_after) if retry_after and retry_after.isdigit() else None
+                log.warning(f"   ⚠️  {r.status_code} en {url} "
+                            f"(rate limit/timeout, intento {intento}/{config.MAX_REINTENTOS})")
+                if intento < config.MAX_REINTENTOS:
+                    espera = espera_forzada or config.BACKOFF_INICIAL * (2 ** (intento - 1))
+                    log.info(f"   ⏳ Esperando {espera}s (rate limit)...")
+                    time.sleep(espera)
+                continue
+
+            # Resto de 4xx = error del cliente, no tiene sentido reintentar
             if 400 <= r.status_code < 500:
                 log.warning(f"   ⚠️  {r.status_code} en {url} (error del cliente, no reintenta)")
                 log.warning(f"      Respuesta: {r.text[:200]}")
@@ -131,22 +143,36 @@ def http_get_con_retry(url, headers, params=None):
 
 
 def get_core(endpoint):
-    """Consume un endpoint de Buk Core con paginación completa."""
-    datos, pag = [], 1
+    """Consume un endpoint de Buk Core con paginación completa.
+
+    Retorna (DataFrame|None, completo: bool).
+    completo=False ⇒ la descarga se cortó por un error de red/API y los datos
+    están INCOMPLETOS. En ese caso NO es seguro hacer refresh_completo (TRUNCATE),
+    porque borraría filas que sí existen pero no se alcanzaron a bajar.
+    """
+    datos, pag, completo = [], 1, True
     while pag <= config.MAX_PAGES:
         r = http_get_con_retry(
             f"{URL_CORE}/{endpoint}?per_page={config.PAGE_SIZE}&page={pag}",
             headers=HDR_CORE
         )
+        # Corte por ERROR → descarga incompleta
         if r is None or r.status_code != 200:
+            log.error(f"   ❌ {endpoint}: página {pag} falló → descarga INCOMPLETA")
+            completo = False
             break
         chunk = r.json().get("data", [])
+        # Corte por FIN de datos → descarga completa
         if not chunk:
             break
         datos.extend(chunk)
         log.info(f"   ✅ {endpoint}: página {pag} → {len(chunk)} filas")
         pag += 1
-    return pd.DataFrame(datos) if datos else None
+        # Página incompleta = última página, ya no hay más
+        if len(chunk) < config.PAGE_SIZE:
+            break
+    df = pd.DataFrame(datos) if datos else None
+    return df, completo
 
 
 def get_asist(endpoint, params=None):
@@ -518,8 +544,8 @@ def main():
 
         # ─── Buk Core ────────────────────────────────────────────
         log.info("\n📦 Buk Core (empleados y áreas)...")
-        df_emp  = get_core("employees")
-        df_area = get_core("areas")
+        df_emp,  emp_completo  = get_core("employees")
+        df_area, area_completo = get_core("areas")
 
         # ─── Buk Asistencia: recintos ────────────────────────────
         log.info("\n📦 Buk Asistencia — recintos...")
@@ -548,7 +574,7 @@ def main():
                         params_inasist = {"obra_id": obra_id, "from":  d_str, "to":    h_str}
 
                         df_m = get_asist_paginated("v2/asistencia-empresa", params_marcas)
-                        df_i = get_asist("obtenerInasistencias", params_inasist)
+                        df_i = get_asist_paginated("obtenerInasistencias", params_inasist)
 
                         if df_m is not None and not df_m.empty:
                             marcas_acumuladas.append(df_m)
@@ -568,7 +594,16 @@ def main():
         # ─── Cargar a Supabase ───────────────────────────────────
         log.info("\n💾 Cargando a Supabase...")
 
-        resumen["empleados"] = refresh_completo(conn, df_empleados, "empleados")
+        # CRÍTICO: solo hacemos refresh completo (TRUNCATE + reinsert) si la descarga
+        # de Buk Core fue COMPLETA. Si vino parcial por un error de red/API, conservamos
+        # la tabla actual para no borrar empleados en silencio.
+        if emp_completo and area_completo:
+            resumen["empleados"] = refresh_completo(conn, df_empleados, "empleados")
+        else:
+            log.warning("   ⛔ Descarga de Buk Core INCOMPLETA → se OMITE el refresh de "
+                        "'empleados'. La tabla conserva la última carga válida.")
+            resumen["empleados"] = 0
+
         resumen["recintos"]  = refresh_completo(conn, df_recintos,  "recintos")
 
         n, a = upsert_df(conn, df_marcas, "asistencias_marcas", pk_cols=("id",))
