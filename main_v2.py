@@ -162,15 +162,13 @@ def get_core(endpoint):
             completo = False
             break
         chunk = r.json().get("data", [])
-        # Corte por FIN de datos → descarga completa
+        # ÚNICO corte por FIN de datos → página vacía = ya no hay más.
+        # NO asumimos el tamaño de página: Buk puede devolver 25 aunque pidas 100.
         if not chunk:
             break
         datos.extend(chunk)
         log.info(f"   ✅ {endpoint}: página {pag} → {len(chunk)} filas")
         pag += 1
-        # Página incompleta = última página, ya no hay más
-        if len(chunk) < config.PAGE_SIZE:
-            break
     df = pd.DataFrame(datos) if datos else None
     return df, completo
 
@@ -196,12 +194,11 @@ def get_asist_paginated(endpoint, params=None):
     for pag in range(1, config.MAX_PAGES + 1):
         p = {**base, "page": pag, "page_size": config.PAGE_SIZE}
         df = get_asist(endpoint, p)
+        # ÚNICO corte: página vacía. Igual que get_core, sin asumir tamaño de página.
         if df is None or df.empty:
             break
         partes.append(df)
         log.info(f"      📄 página {pag}: {len(df)} filas")
-        if len(df) < config.PAGE_SIZE:
-            break
     return pd.concat(partes, ignore_index=True) if partes else None
 
 
