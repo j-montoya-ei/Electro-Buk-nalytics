@@ -425,9 +425,13 @@ def transformar_marcas(df_marcas):
         if col in df.columns:
             df[col] = df[col].astype(bool)
 
-    # Dedup por id
+    # Descartar marcas sin id (la PK es NOT NULL) + dedup por id
     if "id" in df.columns:
+        df = df.dropna(subset=["id"])
         df = df.drop_duplicates(subset=["id"]).reset_index(drop=True)
+    else:
+        # Sin columna id no hay nada válido que insertar
+        return None
 
     # Quedarnos solo con las columnas del esquema Postgres
     cols_esperadas = [
@@ -453,9 +457,10 @@ def transformar_inasistencias(df_inasist):
     if "DNI" in df.columns and "dni" not in df.columns:
         df = df.rename(columns={"DNI": "dni"})
 
-    # Deduplicar por PK compuesta
+    # Deduplicar por PK compuesta + descartar filas con PK incompleta (NOT NULL)
     pk = ["obra_id", "dni", "ano", "mes", "dia"]
     if all(c in df.columns for c in pk):
+        df = df.dropna(subset=pk)
         df = df.drop_duplicates(subset=pk).reset_index(drop=True)
 
     cols_esperadas = ["obra_id", "dni", "ano", "mes", "dia", "motivo"]
