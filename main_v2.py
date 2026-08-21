@@ -18,6 +18,8 @@ import logging
 import requests
 import pandas as pd
 import psycopg2
+import calendar
+
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -466,7 +468,84 @@ def transformar_inasistencias(df_inasist):
     cols_esperadas = ["obra_id", "dni", "ano", "mes", "dia", "motivo"]
     cols_presentes = [c for c in cols_esperadas if c in df.columns]
     return df[cols_presentes].copy()
+  
+# ─── Horas extras ───────────────────────────────────────────────────────
+def meses_a_procesar(modo_backfill):
+    """Lista de (ano, mes) a refrescar para horas extras.
+    - Incremental: mes en curso + mes anterior (capta aprobaciones tardías).
+    - Backfill: desde julio-2026 (inicio de datos confiables) hasta hoy.
+    """
+    hoy = datetime.now()
+    ano_actual, mes_actual = hoy.year, hoy.month
 
+    if modo_backfill:
+        a, m = 2026, 7  # julio 2026: inicio de datos confiables
+        meses = []
+        while (a, m) <= (ano_actual, mes_actual):
+            meses.append((a, m))
+            m += 1
+            if m > 12:
+                m, a = 1, a + 1
+        return meses
+
+    # Incremental: mes anterior + mes actual
+    anterior = (ano_actual - 1, 12) if mes_actual == 1 else (ano_actual, mes_actual - 1)
+    return [anterior, (ano_actual, mes_actual)]
+
+
+def get_horas_extras_mes(obra_id, ano, mes):
+    """Trae el acumulado de horas extras de un recinto para un MES COMPLETO.
+    El endpoint devuelve el acumulado del rango; por eso se pide el mes entero
+    (día 1 → último día), nunca ventanas parciales.
+    """
+    ultimo_dia = calendar.monthrange(ano, mes)[1]
+    from_str = f"01-{mes:02d}-{ano}"
+    to_str   = f"{ultimo_dia:02d}-{mes:02d}-{ano}"
+
+    log.info(f"      🗓️  Horas extras {from_str} → {to_str} (obra_id={obra_id})")
+    params = {"obra_id": obra_id, "from": from_str, "to": to_str}
+    df = get_asist_paginated("obtenerHorasExtras", params)
+
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df["ano"] = ano
+    df["mes"] = mes
+    return df
+
+
+def transformar_horas_extras(df_he):
+    """Normaliza las horas extras al esquema Postgres (tabla horas_extras)."""
+    if df_he is None or df_he.empty:
+        return None
+
+    df = df_he.copy()
+    renombrar = {
+        "DNI": "dni",
+        "Horas Extras 50%": "he_50",
+        "Horas Extras 100%": "he_100",
+        "total_horas_extras": "total_he",
+    }
+    df = df.rename(columns={k: v for k, v in renombrar.items() if k in df.columns})
+
+    if "dni" in df.columns:
+        df["dni"] = df["dni"].astype(str).str.strip()
+
+    for col in ("he_50", "he_100", "total_he"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        else:
+            df[col] = 0
+
+    # PK (dni, ano, mes): descartar filas con PK incompleta + dedup
+    pk = ["dni", "ano", "mes"]
+    if all(c in df.columns for c in pk):
+        df = df.dropna(subset=pk)
+        df = df.drop_duplicates(subset=pk).reset_index(drop=True)
+
+    cols = ["obra_id", "dni", "ano", "mes", "he_50", "he_100", "total_he"]
+    return df[[c for c in cols if c in df.columns]].copy()
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. sync_log (observabilidad)
@@ -585,13 +664,29 @@ def main():
 
         df_marcas_raw  = pd.concat(marcas_acumuladas,  ignore_index=True) if marcas_acumuladas  else None
         df_inasist_raw = pd.concat(inasist_acumuladas, ignore_index=True) if inasist_acumuladas else None
-
+      
+        # ─── Buk Asistencia: horas extras (por MES completo) ─────
+        meses_he = meses_a_procesar(modo_backfill)
+        log.info(f"\n📦 Horas extras — meses a procesar: {meses_he}")
+        he_acumuladas = []
+        if df_recintos_raw is not None and not df_recintos_raw.empty:
+            id_col_he = next((c for c in ("obra_id", "obraId") if c in df_recintos_raw.columns), None)
+            if id_col_he:
+                for _, recinto in df_recintos_raw.iterrows():
+                    obra_id = recinto[id_col_he]
+                    for ano_he, mes_he in meses_he:
+                        df_he = get_horas_extras_mes(obra_id, ano_he, mes_he)
+                        if df_he is not None and not df_he.empty:
+                            he_acumuladas.append(df_he)
+        df_he_raw = pd.concat(he_acumuladas, ignore_index=True) if he_acumuladas else None
+      
         # ─── Transformaciones ────────────────────────────────────
         log.info("\n🔧 Transformando datos...")
         df_empleados   = transformar_empleados(df_emp, df_area)
         df_recintos    = transformar_recintos(df_recintos_raw)
         df_marcas      = transformar_marcas(df_marcas_raw)
         df_inasist     = transformar_inasistencias(df_inasist_raw)
+        df_horas_extras = transformar_horas_extras(df_he_raw)
 
         # ─── Cargar a Supabase ───────────────────────────────────
         log.info("\n💾 Cargando a Supabase...")
@@ -616,7 +711,13 @@ def main():
                          pk_cols=("obra_id", "dni", "ano", "mes", "dia"))
         resumen["inasist_nuevas"]      = n
         resumen["inasist_actualizadas"] = a
+      
+        n, a = upsert_df(conn, df_horas_extras, "horas_extras",
+                         pk_cols=("dni", "ano", "mes"))
+        resumen["he_nuevas"]       = n
+        resumen["he_actualizadas"] = a
 
+    
         # ─── Cerrar sync_log OK ──────────────────────────────────
         cerrar_sync_log(conn, sync_id, resumen, estado="ok")
 
@@ -628,6 +729,8 @@ def main():
                  f"{resumen.get('marcas_actualizadas', 0)} actualizadas")
         log.info(f"   Inasistencias: {resumen.get('inasist_nuevas', 0)} nuevas, "
                  f"{resumen.get('inasist_actualizadas', 0)} actualizadas")
+              log.info(f"   Horas extras:  {resumen.get('he_nuevas', 0)} nuevas, "
+                 f"{resumen.get('he_actualizadas', 0)} actualizadas")
         log.info("=" * 65)
 
     except Exception as e:
