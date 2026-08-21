@@ -287,7 +287,7 @@ def upsert_df(conn, df, tabla, pk_cols, cols_actualizar=None):
 
     nuevas       = despues - antes
     actualizadas = len(df) - nuevas
-    log.info(f"   ✅ {tabla:<22} → {despues} totales ({nuevas} nuevas, {actualizadas} actualizadas)")
+    log.info(f"   ✅ {tabla:<26} → {despues} totales ({nuevas} nuevas, {actualizadas} actualizadas)")
     return nuevas, actualizadas
 
 
@@ -306,7 +306,7 @@ def refresh_completo(conn, df, tabla):
         execute_values(cur, sql, rows, page_size=500)
 
     conn.commit()
-    log.info(f"   ✅ {tabla:<22} → {len(df)} filas (refresh completo)")
+    log.info(f"   ✅ {tabla:<26} → {len(df)} filas (refresh completo)")
     return len(df)
 
 
@@ -448,6 +448,70 @@ def transformar_marcas(df_marcas):
     return df[cols_presentes].copy()
 
 
+def transformar_marcas_detalle(df_det):
+    """Normaliza las marcas granulares (obtenerRegistroAsistencia) al esquema
+    de la tabla asistencias_marcas_detalle.
+
+    Cada fila del API = una marca (entrada o salida). Buk envía la fecha y la
+    hora partidas en enteros (ano/mes/dia + hora/minutos/segundos); aquí se
+    reconstruyen a `fecha` (date) y `hora_marca` (time).
+
+    Tabla destino:
+      PK  (obra_id, dni, fecha, hora_marca, sentido)
+      CHECK sentido IN ('entrada','salida')
+    """
+    if df_det is None or df_det.empty:
+        return None
+
+    df = df_det.copy()
+
+    # DNI puede venir en mayúscula
+    if "DNI" in df.columns and "dni" not in df.columns:
+        df = df.rename(columns={"DNI": "dni"})
+    if "dni" in df.columns:
+        df["dni"] = df["dni"].astype(str).str.strip()
+
+    # Necesitamos los 6 componentes para reconstruir el timestamp. Si faltan,
+    # no hay marca válida que guardar → se omite (no se inventa nada).
+    componentes = ["ano", "mes", "dia", "hora", "minutos", "segundos"]
+    if not all(c in df.columns for c in componentes):
+        log.warning("   ⚠️  marcas_detalle: faltan componentes de fecha/hora, se omite el lote")
+        return None
+
+    # Reconstruir timestamp desde los enteros. errors="coerce" → una fila con
+    # componentes inválidos queda NaT y luego se descarta por la PK.
+    ts = pd.to_datetime(dict(
+        year   = pd.to_numeric(df["ano"],      errors="coerce"),
+        month  = pd.to_numeric(df["mes"],      errors="coerce"),
+        day    = pd.to_numeric(df["dia"],      errors="coerce"),
+        hour   = pd.to_numeric(df["hora"],     errors="coerce"),
+        minute = pd.to_numeric(df["minutos"],  errors="coerce"),
+        second = pd.to_numeric(df["segundos"], errors="coerce"),
+    ), errors="coerce")
+    df["fecha"]      = ts.dt.date
+    df["hora_marca"] = ts.dt.time
+
+    # sentido: normalizar y quedarnos SOLO con valores válidos. Esto respeta el
+    # CHECK de la tabla: si Buk enviara un sentido raro, esa marca se descarta
+    # en vez de tumbar toda la carga.
+    if "sentido" not in df.columns:
+        log.warning("   ⚠️  marcas_detalle: no viene la columna 'sentido', se omite el lote")
+        return None
+    df["sentido"] = df["sentido"].astype(str).str.strip().str.lower()
+    df = df[df["sentido"].isin(("entrada", "salida"))]
+
+    # PK compuesta: descartar filas con PK incompleta + dedup
+    pk = ["obra_id", "dni", "fecha", "hora_marca", "sentido"]
+    df = df.dropna(subset=pk)
+    df = df.drop_duplicates(subset=pk).reset_index(drop=True)
+
+    if df.empty:
+        return None
+
+    cols = ["obra_id", "dni", "fecha", "hora_marca", "sentido", "origen", "dispositivo"]
+    return df[[c for c in cols if c in df.columns]].copy()
+
+
 def transformar_inasistencias(df_inasist):
     """Normaliza inasistencias al esquema Postgres (columnas en minúscula)."""
     if df_inasist is None or df_inasist.empty:
@@ -468,7 +532,8 @@ def transformar_inasistencias(df_inasist):
     cols_esperadas = ["obra_id", "dni", "ano", "mes", "dia", "motivo"]
     cols_presentes = [c for c in cols_esperadas if c in df.columns]
     return df[cols_presentes].copy()
-  
+
+
 # ─── Horas extras ───────────────────────────────────────────────────────
 def meses_a_procesar(modo_backfill):
     """Lista de (ano, mes) a refrescar para horas extras.
@@ -546,6 +611,7 @@ def transformar_horas_extras(df_he):
 
     cols = ["obra_id", "dni", "ano", "mes", "he_50", "he_100", "total_he"]
     return df[[c for c in cols if c in df.columns]].copy()
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. sync_log (observabilidad)
@@ -632,12 +698,13 @@ def main():
         log.info("\n📦 Buk Asistencia — recintos...")
         df_recintos_raw = get_asist("informacionRecinto", {"page": 1, "page_size": 100})
 
-        # ─── Buk Asistencia: marcas + inasistencias ──────────────
+        # ─── Buk Asistencia: marcas + inasistencias + marcas detalle ──────────
         fecha_hasta = datetime.now()
         fecha_desde = fecha_hasta - timedelta(days=dias)
         log.info(f"\n📅 Ventana de asistencia: {fecha_desde:%d-%m-%Y} → {fecha_hasta:%d-%m-%Y}")
 
         marcas_acumuladas, inasist_acumuladas = [], []
+        marcas_detalle_acumuladas = []
 
         if df_recintos_raw is not None and not df_recintos_raw.empty:
             id_col     = next((c for c in ("obra_id", "obraId") if c in df_recintos_raw.columns), None)
@@ -653,18 +720,23 @@ def main():
                         log.info(f"   🗓️  Ventana {d_str} → {h_str}")
                         params_marcas  = {"obra_id": obra_id, "desde": d_str, "hasta": h_str}
                         params_inasist = {"obra_id": obra_id, "from":  d_str, "to":    h_str}
+                        params_detalle = {"obra_id": obra_id, "from":  d_str, "to":    h_str}
 
                         df_m = get_asist_paginated("v2/asistencia-empresa", params_marcas)
                         df_i = get_asist_paginated("obtenerInasistencias", params_inasist)
+                        df_d = get_asist_paginated("obtenerRegistroAsistencia", params_detalle)
 
                         if df_m is not None and not df_m.empty:
                             marcas_acumuladas.append(df_m)
                         if df_i is not None and not df_i.empty:
                             inasist_acumuladas.append(df_i)
+                        if df_d is not None and not df_d.empty:
+                            marcas_detalle_acumuladas.append(df_d)
 
-        df_marcas_raw  = pd.concat(marcas_acumuladas,  ignore_index=True) if marcas_acumuladas  else None
-        df_inasist_raw = pd.concat(inasist_acumuladas, ignore_index=True) if inasist_acumuladas else None
-      
+        df_marcas_raw   = pd.concat(marcas_acumuladas,         ignore_index=True) if marcas_acumuladas         else None
+        df_inasist_raw  = pd.concat(inasist_acumuladas,        ignore_index=True) if inasist_acumuladas        else None
+        df_detalle_raw  = pd.concat(marcas_detalle_acumuladas, ignore_index=True) if marcas_detalle_acumuladas else None
+
         # ─── Buk Asistencia: horas extras (por MES completo) ─────
         meses_he = meses_a_procesar(modo_backfill)
         log.info(f"\n📦 Horas extras — meses a procesar: {meses_he}")
@@ -679,14 +751,15 @@ def main():
                         if df_he is not None and not df_he.empty:
                             he_acumuladas.append(df_he)
         df_he_raw = pd.concat(he_acumuladas, ignore_index=True) if he_acumuladas else None
-      
+
         # ─── Transformaciones ────────────────────────────────────
         log.info("\n🔧 Transformando datos...")
-        df_empleados   = transformar_empleados(df_emp, df_area)
-        df_recintos    = transformar_recintos(df_recintos_raw)
-        df_marcas      = transformar_marcas(df_marcas_raw)
-        df_inasist     = transformar_inasistencias(df_inasist_raw)
-        df_horas_extras = transformar_horas_extras(df_he_raw)
+        df_empleados      = transformar_empleados(df_emp, df_area)
+        df_recintos       = transformar_recintos(df_recintos_raw)
+        df_marcas         = transformar_marcas(df_marcas_raw)
+        df_marcas_detalle = transformar_marcas_detalle(df_detalle_raw)
+        df_inasist        = transformar_inasistencias(df_inasist_raw)
+        df_horas_extras   = transformar_horas_extras(df_he_raw)
 
         # ─── Cargar a Supabase ───────────────────────────────────
         log.info("\n💾 Cargando a Supabase...")
@@ -707,29 +780,37 @@ def main():
         resumen["marcas_nuevas"]      = n
         resumen["marcas_actualizadas"] = a
 
+        # Marcas granulares (entrada/salida por marca) → tabla nueva, cruda.
+        # La lógica de mañana/tarde vive después en las vistas, no aquí.
+        n, a = upsert_df(conn, df_marcas_detalle, "asistencias_marcas_detalle",
+                         pk_cols=("obra_id", "dni", "fecha", "hora_marca", "sentido"))
+        resumen["detalle_nuevas"]      = n
+        resumen["detalle_actualizadas"] = a
+
         n, a = upsert_df(conn, df_inasist, "inasistencias",
                          pk_cols=("obra_id", "dni", "ano", "mes", "dia"))
         resumen["inasist_nuevas"]      = n
         resumen["inasist_actualizadas"] = a
-      
+
         n, a = upsert_df(conn, df_horas_extras, "horas_extras",
                          pk_cols=("dni", "ano", "mes"))
         resumen["he_nuevas"]       = n
         resumen["he_actualizadas"] = a
 
-    
         # ─── Cerrar sync_log OK ──────────────────────────────────
         cerrar_sync_log(conn, sync_id, resumen, estado="ok")
 
         log.info("\n" + "=" * 65)
         log.info("✅ PROCESO COMPLETADO OK")
-        log.info(f"   Empleados:     {resumen.get('empleados', 0)}")
-        log.info(f"   Recintos:      {resumen.get('recintos', 0)}")
-        log.info(f"   Marcas:        {resumen.get('marcas_nuevas', 0)} nuevas, "
+        log.info(f"   Empleados:      {resumen.get('empleados', 0)}")
+        log.info(f"   Recintos:       {resumen.get('recintos', 0)}")
+        log.info(f"   Marcas:         {resumen.get('marcas_nuevas', 0)} nuevas, "
                  f"{resumen.get('marcas_actualizadas', 0)} actualizadas")
-        log.info(f"   Inasistencias: {resumen.get('inasist_nuevas', 0)} nuevas, "
+        log.info(f"   Marcas detalle: {resumen.get('detalle_nuevas', 0)} nuevas, "
+                 f"{resumen.get('detalle_actualizadas', 0)} actualizadas")
+        log.info(f"   Inasistencias:  {resumen.get('inasist_nuevas', 0)} nuevas, "
                  f"{resumen.get('inasist_actualizadas', 0)} actualizadas")
-        log.info(f"   Horas extras:  {resumen.get('he_nuevas', 0)} nuevas, "
+        log.info(f"   Horas extras:   {resumen.get('he_nuevas', 0)} nuevas, "
                  f"{resumen.get('he_actualizadas', 0)} actualizadas")
         log.info("=" * 65)
 
