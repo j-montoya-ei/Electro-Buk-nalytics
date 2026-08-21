@@ -190,7 +190,13 @@ def get_asist(endpoint, params=None):
 
 
 def get_asist_paginated(endpoint, params=None):
-    """Paginación completa para endpoints de Asistencia."""
+    """Paginación completa para endpoints de Asistencia.
+
+    Corta cuando llega una página vacía. Válido para endpoints con pocos
+    registros por ventana (marcas consolidadas, inasistencias, horas extras).
+    Para endpoints con MUCHAS páginas y bloque `pagination.totalPages`, usar
+    get_asist_paginated_v2 (corta por totalPages, no espera la página vacía).
+    """
     base = dict(params or {})
     partes = []
     for pag in range(1, config.MAX_PAGES + 1):
@@ -201,6 +207,75 @@ def get_asist_paginated(endpoint, params=None):
             break
         partes.append(df)
         log.info(f"      📄 página {pag}: {len(df)} filas")
+    return pd.concat(partes, ignore_index=True) if partes else None
+
+
+def get_asist_paginated_v2(endpoint, params=None):
+    """Paginación para endpoints de Asistencia que exponen `pagination.totalPages`
+    (ej. obtenerRegistroAsistencia).
+
+    POR QUÉ EXISTE: este endpoint IGNORA el page_size solicitado y entrega 25
+    filas por página. Con datos de todo el recinto son cientos de páginas por
+    ventana; el paginador clásico (get_asist_paginated), que solo corta al llegar
+    a una página vacía, tardaría demasiado y además se toparía con MAX_PAGES
+    perdiendo datos. Aquí cortamos usando el `totalPages` que envía Buk.
+
+    FALLBACK: si la respuesta NO trae `pagination.totalPages`, se comporta como el
+    paginador clásico (corta al llegar a página vacía, con tope MAX_PAGES).
+    """
+    base = dict(params or {})
+    partes = []
+    pag = 1
+    total_pages = None
+
+    while True:
+        p = {**base, "page": pag, "page_size": config.PAGE_SIZE}
+        r = http_get_con_retry(f"{URL_ASIST}/{endpoint}", headers=HDR_ASIST, params=p)
+        if r is None or r.status_code != 200:
+            break
+
+        body = r.json()
+
+        # Separar registros de metadatos de paginación
+        if isinstance(body, dict):
+            paginacion = body.get("pagination") or {}
+            registros = None
+            for key in ("data", "items", "asistencias", "registros"):
+                if body.get(key):
+                    registros = body[key]
+                    break
+            registros = registros or []
+        elif isinstance(body, list):
+            paginacion, registros = {}, body
+        else:
+            paginacion, registros = {}, []
+
+        # Capturar totalPages la primera vez que aparezca
+        if total_pages is None:
+            tp = paginacion.get("totalPages")
+            if isinstance(tp, int) and tp > 0:
+                total_pages = tp
+
+        if registros:
+            partes.append(pd.DataFrame(registros))
+            log.info(f"      📄 página {pag}/{total_pages or '?'}: {len(registros)} filas")
+
+        # ─── Criterio de corte ───
+        if total_pages is not None:
+            # Confiamos en el conteo de Buk. Sin tope MAX_PAGES aquí, para no
+            # perder datos si hay más de MAX_PAGES páginas legítimas.
+            if pag >= total_pages:
+                break
+        else:
+            # Sin totalPages → comportamiento clásico: parar en página vacía.
+            if not registros:
+                break
+            if pag >= config.MAX_PAGES:
+                log.warning(f"   ⚠️  {endpoint}: tope MAX_PAGES alcanzado sin totalPages")
+                break
+
+        pag += 1
+
     return pd.concat(partes, ignore_index=True) if partes else None
 
 
@@ -724,7 +799,8 @@ def main():
 
                         df_m = get_asist_paginated("v2/asistencia-empresa", params_marcas)
                         df_i = get_asist_paginated("obtenerInasistencias", params_inasist)
-                        df_d = get_asist_paginated("obtenerRegistroAsistencia", params_detalle)
+                        # Detalle: usa el paginador v2 (corta por totalPages, no por página vacía)
+                        df_d = get_asist_paginated_v2("obtenerRegistroAsistencia", params_detalle)
 
                         if df_m is not None and not df_m.empty:
                             marcas_acumuladas.append(df_m)
