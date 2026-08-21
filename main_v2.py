@@ -729,7 +729,7 @@ def main():
                  f"{resumen.get('marcas_actualizadas', 0)} actualizadas")
         log.info(f"   Inasistencias: {resumen.get('inasist_nuevas', 0)} nuevas, "
                  f"{resumen.get('inasist_actualizadas', 0)} actualizadas")
-              log.info(f"   Horas extras:  {resumen.get('he_nuevas', 0)} nuevas, "
+        log.info(f"   Horas extras:  {resumen.get('he_nuevas', 0)} nuevas, "
                  f"{resumen.get('he_actualizadas', 0)} actualizadas")
         log.info("=" * 65)
 
