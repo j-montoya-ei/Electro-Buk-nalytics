@@ -37,7 +37,7 @@ jobs:
   ejecutar-etl:
     name: Sincronizar Buk con Supabase
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       # 1. Bajar el código del repo
