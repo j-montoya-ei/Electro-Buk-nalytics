@@ -8,7 +8,7 @@ Editar aquí cambia el comportamiento sin tocar la lógica.
 # ─── Ventanas de sincronización ──────────────────────────────
 # BACKFILL: cuando la BD está vacía, trae historia larga
 # INCREMENTAL: corridas normales del Task Scheduler / GitHub Actions
-DIAS_BACKFILL    = 90
+DIAS_BACKFILL    = 55
 DIAS_INCREMENTAL = 5
 
 # ─── HTTP / Reintentos ───────────────────────────────────────
