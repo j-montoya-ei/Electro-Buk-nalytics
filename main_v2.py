@@ -214,6 +214,11 @@ def get_asist_paginated_v2(endpoint, params=None):
     """Paginación para endpoints de Asistencia que exponen `pagination.totalPages`
     (ej. obtenerRegistroAsistencia).
 
+    Retorna (DataFrame|None, completo: bool)  ← MISMO CONTRATO QUE get_core.
+    completo=False ⇒ la ventana se cortó por un error de red/API (reintentos
+    agotados) o por el tope MAX_PAGES. Los datos de ESA ventana están
+    INCOMPLETOS. El caller debe registrarlo y NO tratar la corrida como limpia.
+
     POR QUÉ EXISTE: este endpoint IGNORA el page_size solicitado y entrega 25
     filas por página. Con datos de todo el recinto son cientos de páginas por
     ventana; el paginador clásico (get_asist_paginated), que solo corta al llegar
@@ -221,17 +226,27 @@ def get_asist_paginated_v2(endpoint, params=None):
     perdiendo datos. Aquí cortamos usando el `totalPages` que envía Buk.
 
     FALLBACK: si la respuesta NO trae `pagination.totalPages`, se comporta como el
-    paginador clásico (corta al llegar a página vacía, con tope MAX_PAGES).
+    paginador clásico (corta al llegar a página vacía, con tope MAX_PAGES → que
+    en ese caso marca la ventana como INCOMPLETA).
     """
     base = dict(params or {})
     partes = []
     pag = 1
     total_pages = None
+    completo = True
 
     while True:
         p = {**base, "page": pag, "page_size": config.PAGE_SIZE}
         r = http_get_con_retry(f"{URL_ASIST}/{endpoint}", headers=HDR_ASIST, params=p)
+
+        # ─── Corte por ERROR ───
+        # Antes esto hacía un `break` silencioso: devolvía lo parcial como si
+        # hubiera terminado bien. Ahora se marca INCOMPLETO para no disfrazar un
+        # hueco de éxito. El caller decide (aquí: sube lo que haya y avisa fuerte).
         if r is None or r.status_code != 200:
+            log.error(f"   ❌ {endpoint}: página {pag} falló tras reintentos "
+                      f"→ ventana INCOMPLETA")
+            completo = False
             break
 
         body = r.json()
@@ -271,12 +286,16 @@ def get_asist_paginated_v2(endpoint, params=None):
             if not registros:
                 break
             if pag >= config.MAX_PAGES:
-                log.warning(f"   ⚠️  {endpoint}: tope MAX_PAGES alcanzado sin totalPages")
+                # Tope alcanzado SIN saber cuántas páginas faltan → INCOMPLETO.
+                log.warning(f"   ⚠️  {endpoint}: tope MAX_PAGES ({config.MAX_PAGES}) "
+                            f"sin totalPages → ventana INCOMPLETA")
+                completo = False
                 break
 
         pag += 1
 
-    return pd.concat(partes, ignore_index=True) if partes else None
+    df = pd.concat(partes, ignore_index=True) if partes else None
+    return df, completo
 
 
 def chunks_fechas(desde, hasta, dias=None):
@@ -780,6 +799,10 @@ def main():
 
         marcas_acumuladas, inasist_acumuladas = [], []
         marcas_detalle_acumuladas = []
+        # Bandera global: ¿el detalle granular quedó COMPLETO en todas las
+        # ventanas/recintos? Si alguna ventana se corta (error o MAX_PAGES),
+        # se vuelve False y la corrida lo reporta en grande.
+        detalle_completo_global = True
 
         if df_recintos_raw is not None and not df_recintos_raw.empty:
             id_col     = next((c for c in ("obra_id", "obraId") if c in df_recintos_raw.columns), None)
@@ -791,23 +814,44 @@ def main():
                     nombre  = recinto[nombre_col] if nombre_col else obra_id
                     log.info(f"\n📦 Recinto: {nombre} (id={obra_id})")
 
+                    # ── Loop 1: marcas consolidadas + inasistencias ──────────
+                    # Ventana de 30 días (DIAS_POR_VENTANA). Son livianas
+                    # (1 fila/día), así que la ventana grande no genera muchas
+                    # páginas. NO se toca este comportamiento.
                     for d_str, h_str in chunks_fechas(fecha_desde, fecha_hasta):
-                        log.info(f"   🗓️  Ventana {d_str} → {h_str}")
+                        log.info(f"   🗓️  [consolidadas] Ventana {d_str} → {h_str}")
                         params_marcas  = {"obra_id": obra_id, "desde": d_str, "hasta": h_str}
                         params_inasist = {"obra_id": obra_id, "from":  d_str, "to":    h_str}
-                        params_detalle = {"obra_id": obra_id, "from":  d_str, "to":    h_str}
 
                         df_m = get_asist_paginated("v2/asistencia-empresa", params_marcas)
                         df_i = get_asist_paginated("obtenerInasistencias", params_inasist)
-                        # Detalle: usa el paginador v2 (corta por totalPages, no por página vacía)
-                        df_d = get_asist_paginated_v2("obtenerRegistroAsistencia", params_detalle)
 
                         if df_m is not None and not df_m.empty:
                             marcas_acumuladas.append(df_m)
                         if df_i is not None and not df_i.empty:
                             inasist_acumuladas.append(df_i)
+
+                    # ── Loop 2 (AISLADO): marcas granulares ──────────────────
+                    # Ventana CORTA de 5 días (DIAS_POR_VENTANA_DETALLE). Este
+                    # endpoint entrega ~22 páginas por día hábil de todo el
+                    # recinto; con 5 días son ~108 páginas/ventana → imposible
+                    # topar MAX_PAGES. Loop separado para no afectar las
+                    # consolidadas.
+                    for d_str, h_str in chunks_fechas(
+                            fecha_desde, fecha_hasta, dias=config.DIAS_POR_VENTANA_DETALLE):
+                        log.info(f"   🗓️  [granulares] Ventana {d_str} → {h_str}")
+                        params_detalle = {"obra_id": obra_id, "from": d_str, "to": h_str}
+
+                        df_d, det_completo = get_asist_paginated_v2(
+                            "obtenerRegistroAsistencia", params_detalle)
+
                         if df_d is not None and not df_d.empty:
                             marcas_detalle_acumuladas.append(df_d)
+                        # Si CUALQUIER ventana vino incompleta, la corrida no es limpia.
+                        if not det_completo:
+                            detalle_completo_global = False
+                            log.warning(f"   ⚠️  [granulares] Ventana {d_str} → {h_str} "
+                                        f"INCOMPLETA (recinto {obra_id})")
 
         df_marcas_raw   = pd.concat(marcas_acumuladas,         ignore_index=True) if marcas_acumuladas         else None
         df_inasist_raw  = pd.concat(inasist_acumuladas,        ignore_index=True) if inasist_acumuladas        else None
@@ -873,8 +917,12 @@ def main():
         resumen["he_nuevas"]       = n
         resumen["he_actualizadas"] = a
 
-        # ─── Cerrar sync_log OK ──────────────────────────────────
-        cerrar_sync_log(conn, sync_id, resumen, estado="ok")
+        # ─── Cerrar sync_log ─────────────────────────────────────
+        # El detalle granular incompleto NO se persiste en sync_log (esa tabla
+        # no tiene columna para ello; sería otra migración). Se refleja en el
+        # estado de la corrida y en el log final para que sea visible.
+        estado_final = "ok" if detalle_completo_global else "ok_con_avisos"
+        cerrar_sync_log(conn, sync_id, resumen, estado=estado_final)
 
         log.info("\n" + "=" * 65)
         log.info("✅ PROCESO COMPLETADO OK")
@@ -888,6 +936,13 @@ def main():
                  f"{resumen.get('inasist_actualizadas', 0)} actualizadas")
         log.info(f"   Horas extras:   {resumen.get('he_nuevas', 0)} nuevas, "
                  f"{resumen.get('he_actualizadas', 0)} actualizadas")
+        if not detalle_completo_global:
+            log.warning("   " + "─" * 55)
+            log.warning("   ⚠️  ATENCIÓN: al menos UNA ventana de marcas granulares")
+            log.warning("       quedó INCOMPLETA (error de red o tope MAX_PAGES).")
+            log.warning("       El histórico de asistencias_marcas_detalle puede tener")
+            log.warning("       huecos. Vuelve a correr el BACKFILL para rellenarlas")
+            log.warning("       (el UPSERT es idempotente, no duplica).")
         log.info("=" * 65)
 
     except Exception as e:
