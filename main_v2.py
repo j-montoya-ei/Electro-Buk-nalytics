@@ -763,25 +763,36 @@ def main():
 
     resumen = {}
     sync_id = None
-    conn = None
 
     try:
+        # ═══════════════════════════════════════════════════════════════
+        # FASE 1 — Conexión CORTA solo para decidir modo + abrir sync_log
+        # (Antes la conexión se abría aquí y se mantenía viva durante toda
+        #  la extracción de Buk (~38 min), quedaba ociosa y Supabase la
+        #  cerraba → 'SSL connection has been closed unexpectedly' al cargar.
+        #  Ahora se abre, se usa en segundos, y se CIERRA antes de extraer.)
+        # ═══════════════════════════════════════════════════════════════
         conn = conectar()
+        try:
+            backfill_forzado = os.getenv("BACKFILL") == "1"
+            backfill_auto = tabla_vacia(conn, "asistencias_marcas") or tabla_vacia(conn, "inasistencias")
+            modo_backfill = backfill_forzado or backfill_auto
+            dias = config.DIAS_BACKFILL if modo_backfill else config.DIAS_INCREMENTAL
+            modo = "BACKFILL" if modo_backfill else "INCREMENTAL"
 
-        # Decidir modo (BACKFILL vs INCREMENTAL)
-        backfill_forzado = os.getenv("BACKFILL") == "1"
-        backfill_auto = tabla_vacia(conn, "asistencias_marcas") or tabla_vacia(conn, "inasistencias")
-        modo_backfill = backfill_forzado or backfill_auto
-        dias = config.DIAS_BACKFILL if modo_backfill else config.DIAS_INCREMENTAL
-        modo = "BACKFILL" if modo_backfill else "INCREMENTAL"
+            razon = ("forzado por variable de entorno BACKFILL=1" if backfill_forzado
+                     else "tabla vacía detectada" if backfill_auto
+                     else "corrida normal")
+            log.info(f"⚙️  Modo: {modo} ({dias} días, {razon})")
 
-        razon = ("forzado por variable de entorno BACKFILL=1" if backfill_forzado
-                 else "tabla vacía detectada" if backfill_auto
-                 else "corrida normal")
-        log.info(f"⚙️  Modo: {modo} ({dias} días, {razon})")
+            sync_id = iniciar_sync_log(conn, modo, dias)
+            log.info(f"📝 sync_log id: {sync_id}")
+        finally:
+            conn.close()   # cerramos: no la necesitamos durante la extracción
 
-        sync_id = iniciar_sync_log(conn, modo, dias)
-        log.info(f"📝 sync_log id: {sync_id}")
+        # ═══════════════════════════════════════════════════════════════
+        # FASE 2 — Extracción de Buk (SIN conexión a Postgres abierta)
+        # ═══════════════════════════════════════════════════════════════
 
         # ─── Buk Core ────────────────────────────────────────────
         log.info("\n📦 Buk Core (empleados y áreas)...")
@@ -799,9 +810,6 @@ def main():
 
         marcas_acumuladas, inasist_acumuladas = [], []
         marcas_detalle_acumuladas = []
-        # Bandera global: ¿el detalle granular quedó COMPLETO en todas las
-        # ventanas/recintos? Si alguna ventana se corta (error o MAX_PAGES),
-        # se vuelve False y la corrida lo reporta en grande.
         detalle_completo_global = True
 
         if df_recintos_raw is not None and not df_recintos_raw.empty:
@@ -815,9 +823,6 @@ def main():
                     log.info(f"\n📦 Recinto: {nombre} (id={obra_id})")
 
                     # ── Loop 1: marcas consolidadas + inasistencias ──────────
-                    # Ventana de 30 días (DIAS_POR_VENTANA). Son livianas
-                    # (1 fila/día), así que la ventana grande no genera muchas
-                    # páginas. NO se toca este comportamiento.
                     for d_str, h_str in chunks_fechas(fecha_desde, fecha_hasta):
                         log.info(f"   🗓️  [consolidadas] Ventana {d_str} → {h_str}")
                         params_marcas  = {"obra_id": obra_id, "desde": d_str, "hasta": h_str}
@@ -832,11 +837,6 @@ def main():
                             inasist_acumuladas.append(df_i)
 
                     # ── Loop 2 (AISLADO): marcas granulares ──────────────────
-                    # Ventana CORTA de 5 días (DIAS_POR_VENTANA_DETALLE). Este
-                    # endpoint entrega ~22 páginas por día hábil de todo el
-                    # recinto; con 5 días son ~108 páginas/ventana → imposible
-                    # topar MAX_PAGES. Loop separado para no afectar las
-                    # consolidadas.
                     for d_str, h_str in chunks_fechas(
                             fecha_desde, fecha_hasta, dias=config.DIAS_POR_VENTANA_DETALLE):
                         log.info(f"   🗓️  [granulares] Ventana {d_str} → {h_str}")
@@ -847,7 +847,6 @@ def main():
 
                         if df_d is not None and not df_d.empty:
                             marcas_detalle_acumuladas.append(df_d)
-                        # Si CUALQUIER ventana vino incompleta, la corrida no es limpia.
                         if not det_completo:
                             detalle_completo_global = False
                             log.warning(f"   ⚠️  [granulares] Ventana {d_str} → {h_str} "
@@ -872,7 +871,7 @@ def main():
                             he_acumuladas.append(df_he)
         df_he_raw = pd.concat(he_acumuladas, ignore_index=True) if he_acumuladas else None
 
-        # ─── Transformaciones ────────────────────────────────────
+        # ─── Transformaciones (tampoco necesitan DB) ─────────────
         log.info("\n🔧 Transformando datos...")
         df_empleados      = transformar_empleados(df_emp, df_area)
         df_recintos       = transformar_recintos(df_recintos_raw)
@@ -881,48 +880,44 @@ def main():
         df_inasist        = transformar_inasistencias(df_inasist_raw)
         df_horas_extras   = transformar_horas_extras(df_he_raw)
 
-        # ─── Cargar a Supabase ───────────────────────────────────
+        # ═══════════════════════════════════════════════════════════════
+        # FASE 3 — Conexión CORTA solo para cargar (dura segundos)
+        # ═══════════════════════════════════════════════════════════════
         log.info("\n💾 Cargando a Supabase...")
+        conn = conectar()
+        try:
+            if emp_completo and area_completo:
+                resumen["empleados"] = refresh_completo(conn, df_empleados, "empleados")
+            else:
+                log.warning("   ⛔ Descarga de Buk Core INCOMPLETA → se OMITE el refresh de "
+                            "'empleados'. La tabla conserva la última carga válida.")
+                resumen["empleados"] = 0
 
-        # CRÍTICO: solo hacemos refresh completo (TRUNCATE + reinsert) si la descarga
-        # de Buk Core fue COMPLETA. Si vino parcial por un error de red/API, conservamos
-        # la tabla actual para no borrar empleados en silencio.
-        if emp_completo and area_completo:
-            resumen["empleados"] = refresh_completo(conn, df_empleados, "empleados")
-        else:
-            log.warning("   ⛔ Descarga de Buk Core INCOMPLETA → se OMITE el refresh de "
-                        "'empleados'. La tabla conserva la última carga válida.")
-            resumen["empleados"] = 0
+            resumen["recintos"]  = refresh_completo(conn, df_recintos,  "recintos")
 
-        resumen["recintos"]  = refresh_completo(conn, df_recintos,  "recintos")
+            n, a = upsert_df(conn, df_marcas, "asistencias_marcas", pk_cols=("id",))
+            resumen["marcas_nuevas"]       = n
+            resumen["marcas_actualizadas"] = a
 
-        n, a = upsert_df(conn, df_marcas, "asistencias_marcas", pk_cols=("id",))
-        resumen["marcas_nuevas"]      = n
-        resumen["marcas_actualizadas"] = a
+            n, a = upsert_df(conn, df_marcas_detalle, "asistencias_marcas_detalle",
+                             pk_cols=("obra_id", "dni", "fecha", "hora_marca", "sentido"))
+            resumen["detalle_nuevas"]       = n
+            resumen["detalle_actualizadas"] = a
 
-        # Marcas granulares (entrada/salida por marca) → tabla nueva, cruda.
-        # La lógica de mañana/tarde vive después en las vistas, no aquí.
-        n, a = upsert_df(conn, df_marcas_detalle, "asistencias_marcas_detalle",
-                         pk_cols=("obra_id", "dni", "fecha", "hora_marca", "sentido"))
-        resumen["detalle_nuevas"]      = n
-        resumen["detalle_actualizadas"] = a
+            n, a = upsert_df(conn, df_inasist, "inasistencias",
+                             pk_cols=("obra_id", "dni", "ano", "mes", "dia"))
+            resumen["inasist_nuevas"]       = n
+            resumen["inasist_actualizadas"] = a
 
-        n, a = upsert_df(conn, df_inasist, "inasistencias",
-                         pk_cols=("obra_id", "dni", "ano", "mes", "dia"))
-        resumen["inasist_nuevas"]      = n
-        resumen["inasist_actualizadas"] = a
+            n, a = upsert_df(conn, df_horas_extras, "horas_extras",
+                             pk_cols=("dni", "ano", "mes"))
+            resumen["he_nuevas"]       = n
+            resumen["he_actualizadas"] = a
 
-        n, a = upsert_df(conn, df_horas_extras, "horas_extras",
-                         pk_cols=("dni", "ano", "mes"))
-        resumen["he_nuevas"]       = n
-        resumen["he_actualizadas"] = a
-
-        # ─── Cerrar sync_log ─────────────────────────────────────
-        # El detalle granular incompleto NO se persiste en sync_log (esa tabla
-        # no tiene columna para ello; sería otra migración). Se refleja en el
-        # estado de la corrida y en el log final para que sea visible.
-        estado_final = "ok" if detalle_completo_global else "ok_con_avisos"
-        cerrar_sync_log(conn, sync_id, resumen, estado=estado_final)
+            estado_final = "ok" if detalle_completo_global else "ok_con_avisos"
+            cerrar_sync_log(conn, sync_id, resumen, estado=estado_final)
+        finally:
+            conn.close()
 
         log.info("\n" + "=" * 65)
         log.info("✅ PROCESO COMPLETADO OK")
@@ -947,9 +942,15 @@ def main():
 
     except Exception as e:
         log.exception(f"❌ Error en la corrida: {e}")
-        if conn and sync_id:
+        # Intento best-effort de marcar el sync_log como error, con conexión NUEVA
+        # (la que falló pudo quedar muerta). Si tampoco se puede, se ignora.
+        if sync_id:
             try:
-                cerrar_sync_log(conn, sync_id, resumen, estado="error", error=str(e))
+                conn_err = conectar()
+                try:
+                    cerrar_sync_log(conn_err, sync_id, resumen, estado="error", error=str(e))
+                finally:
+                    conn_err.close()
             except Exception:
                 pass
         sys.exit(1)
