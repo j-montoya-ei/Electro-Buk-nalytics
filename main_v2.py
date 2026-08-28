@@ -408,16 +408,41 @@ def refresh_completo(conn, df, tabla):
 # 4. TRANSFORMACIONES (limpieza + enriquecimiento)
 # ═══════════════════════════════════════════════════════════════════════
 def transformar_empleados(df_emp, df_area):
-    """Aplica limpieza + reglas de negocio a los empleados."""
+    """Aplica limpieza + reglas de negocio a los empleados.
+ 
+    Caracterización (#8): además de los campos base, extrae 4 atributos
+    verificados en la respuesta cruda de Buk Core `employees`:
+      · escolaridad   ← custom_attributes NIVEL EMPLEADO · llave "Escolaridad"
+      · estrato       ← custom_attributes NIVEL EMPLEADO · llave "Estrato Socioeconómico"
+      · tipo_contrato ← current_job · llave "type_of_contract"
+      · clasificacion ← current_job.custom_attributes · llave "Clasificación"
+ 
+    OJO: hay DOS objetos 'custom_attributes' distintos (uno a nivel empleado y
+    otro dentro de current_job). escolaridad/estrato salen del PRIMERO;
+    clasificacion del SEGUNDO. Mezclarlos traería null en silencio.
+    """
     if df_emp is None or df_area is None:
         log.error("   ❌ No hay datos de empleados o áreas para transformar")
         return None
-
+ 
+    # Normaliza texto: recorta espacios y convierte vacío/None a None, para que
+    # "no diligenciado" sea NULL y no un string vacío que ensucia las distribuciones.
+    def _txt(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+ 
     nombres_map = dict(zip(df_area["id"], df_area["name"]))
-
+ 
     df = df_emp[["document_number", "first_name", "surname", "second_surname",
                  "current_job", "status", "birthday", "active_since", "gender"]].copy()
-
+ 
+    # custom_attributes de NIVEL EMPLEADO (distinto del de current_job).
+    # Defensivo: si el campo faltara en una corrida, escolaridad/estrato quedan
+    # None en vez de tumbar TODO el ETL (mismo criterio que el resto del archivo).
+    df["_ca_emp"] = df_emp["custom_attributes"] if "custom_attributes" in df_emp.columns else None
+ 
     df["Sub_Area"] = df["current_job"].apply(
         lambda x: nombres_map.get(x.get("area_id")) if isinstance(x, dict) else "N/A"
     )
@@ -429,34 +454,56 @@ def transformar_empleados(df_emp, df_area):
         lambda x: homologar_sede(x.get("custom_attributes", {}).get("Sede")) if isinstance(x, dict) else "N/A"
     )
     df["Horario"] = df["current_job"].apply(interpretar_horario)
+ 
+    # ─── Caracterización (#8): 4 atributos nuevos ────────────────────────
+    # Tipo de contrato → current_job.type_of_contract
+    df["Tipo_Contrato"] = df["current_job"].apply(
+        lambda x: _txt(x.get("type_of_contract")) if isinstance(x, dict) else None
+    )
+    # Clasificación (Administrativo/Operativo) → current_job.custom_attributes
+    df["Clasificacion"] = df["current_job"].apply(
+        lambda x: _txt((x.get("custom_attributes") or {}).get("Clasificación"))
+        if isinstance(x, dict) else None
+    )
+    # Escolaridad → custom_attributes NIVEL EMPLEADO
+    df["Escolaridad"] = df["_ca_emp"].apply(
+        lambda x: _txt(x.get("Escolaridad")) if isinstance(x, dict) else None
+    )
+    # Estrato → custom_attributes NIVEL EMPLEADO (llega como texto, p.ej. "3")
+    df["Estrato"] = df["_ca_emp"].apply(
+        lambda x: _txt(x.get("Estrato Socioeconómico")) if isinstance(x, dict) else None
+    )
+ 
     df["Nombre_Completo"] = (
         df["first_name"].fillna("") + " " +
         df["surname"].fillna("") + " " +
         df["second_surname"].fillna("")
     ).str.upper().str.strip().str.replace(r"\s+", " ", regex=True)
     df["Genero"] = df["gender"].map({"M": "Masculino", "F": "Femenino"}).fillna("N/A")
-
+ 
     # Fechas → tipo date (PostgreSQL)
     df["Fecha_Nacimiento"] = pd.to_datetime(df["birthday"],     errors="coerce").dt.date
     df["Fecha_Ingreso"]    = pd.to_datetime(df["active_since"], errors="coerce").dt.date
-
+ 
     # Edad
     hoy = datetime.now().date()
     df["Edad"] = df["Fecha_Nacimiento"].apply(
         lambda b: (hoy - b).days // 365 if pd.notna(b) else None
     )
-
+ 
     df_final = df[[
         "document_number", "Nombre_Completo", "Genero", "Fecha_Nacimiento", "Edad",
-        "Cargo", "Sede", "Division", "Area", "Sub_Area", "status", "Fecha_Ingreso", "Horario"
+        "Cargo", "Sede", "Division", "Area", "Sub_Area", "status", "Fecha_Ingreso", "Horario",
+        "Escolaridad", "Estrato", "Tipo_Contrato", "Clasificacion"
     ]].copy()
-
+ 
     # Renombrar a snake_case (para que coincida con la tabla en Postgres)
     df_final.columns = [
         "documento", "nombre_completo", "genero", "fecha_nacimiento", "edad",
-        "cargo", "sede", "division", "area", "sub_area", "estado", "fecha_ingreso", "horario"
+        "cargo", "sede", "division", "area", "sub_area", "estado", "fecha_ingreso", "horario",
+        "escolaridad", "estrato", "tipo_contrato", "clasificacion"
     ]
-
+ 
     # Deduplicar por documento (por si viene el mismo dos veces)
     df_final = df_final.drop_duplicates(subset=["documento"]).reset_index(drop=True)
     return df_final
