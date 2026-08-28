@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════════════════
+# DEBUG employees (TEMPORAL) — inspecciona la respuesta cruda de Buk Core
+# ─────────────────────────────────────────────────────────────────────
+# Corre debug_empleados.py una sola vez, a mano, desde la pestaña Actions.
+# NO toca Supabase. La salida se ve directo en la consola de la corrida.
+#
+# ⚠️  Borrar este archivo y debug_empleados.py cuando termines de leer el log.
+# ═══════════════════════════════════════════════════════════════════════
+name: DEBUG employees (temporal)
+
+on:
+  # Solo ejecución manual. No hay schedule: nunca corre solo.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    name: Inspeccionar respuesta cruda de employees
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Se pasan las 5 variables aunque el debug solo use Buk Core: al importar
+      # main_v2 corre la validación que hace sys.exit(1) si falta CUALQUIERA.
+      - name: 🔍 Ejecutar debug (debug_empleados.py)
+        env:
+          BUK_TOKEN:            ${{ secrets.BUK_TOKEN }}
+          BASE_URL:             ${{ secrets.BASE_URL }}
+          BUK_ASISTENCIA_TOKEN: ${{ secrets.BUK_ASISTENCIA_TOKEN }}
+          URL_ASISTENCIA:       ${{ secrets.URL_ASISTENCIA }}
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          PYTHONIOENCODING: utf-8
+        run: python debug_empleados.py
