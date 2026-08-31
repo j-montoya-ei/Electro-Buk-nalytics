@@ -409,14 +409,14 @@ def refresh_completo(conn, df, tabla):
 # ═══════════════════════════════════════════════════════════════════════
 def transformar_empleados(df_emp, df_area):
     """Aplica limpieza + reglas de negocio a los empleados.
- 
+
     Caracterización (#8): además de los campos base, extrae 4 atributos
     verificados en la respuesta cruda de Buk Core `employees`:
       · escolaridad   ← custom_attributes NIVEL EMPLEADO · llave "Escolaridad"
       · estrato       ← custom_attributes NIVEL EMPLEADO · llave "Estrato Socioeconómico"
       · tipo_contrato ← current_job · llave "type_of_contract"
       · clasificacion ← current_job.custom_attributes · llave "Clasificación"
- 
+
     OJO: hay DOS objetos 'custom_attributes' distintos (uno a nivel empleado y
     otro dentro de current_job). escolaridad/estrato salen del PRIMERO;
     clasificacion del SEGUNDO. Mezclarlos traería null en silencio.
@@ -424,7 +424,7 @@ def transformar_empleados(df_emp, df_area):
     if df_emp is None or df_area is None:
         log.error("   ❌ No hay datos de empleados o áreas para transformar")
         return None
- 
+
     # Normaliza texto: recorta espacios y convierte vacío/None a None, para que
     # "no diligenciado" sea NULL y no un string vacío que ensucia las distribuciones.
     def _txt(v):
@@ -432,17 +432,17 @@ def transformar_empleados(df_emp, df_area):
             return None
         s = str(v).strip()
         return s or None
- 
+
     nombres_map = dict(zip(df_area["id"], df_area["name"]))
- 
+
     df = df_emp[["document_number", "first_name", "surname", "second_surname",
                  "current_job", "status", "birthday", "active_since", "gender"]].copy()
- 
+
     # custom_attributes de NIVEL EMPLEADO (distinto del de current_job).
     # Defensivo: si el campo faltara en una corrida, escolaridad/estrato quedan
     # None en vez de tumbar TODO el ETL (mismo criterio que el resto del archivo).
     df["_ca_emp"] = df_emp["custom_attributes"] if "custom_attributes" in df_emp.columns else None
- 
+
     df["Sub_Area"] = df["current_job"].apply(
         lambda x: nombres_map.get(x.get("area_id")) if isinstance(x, dict) else "N/A"
     )
@@ -454,7 +454,7 @@ def transformar_empleados(df_emp, df_area):
         lambda x: homologar_sede(x.get("custom_attributes", {}).get("Sede")) if isinstance(x, dict) else "N/A"
     )
     df["Horario"] = df["current_job"].apply(interpretar_horario)
- 
+
     # ─── Caracterización (#8): 4 atributos nuevos ────────────────────────
     # Tipo de contrato → current_job.type_of_contract
     df["Tipo_Contrato"] = df["current_job"].apply(
@@ -473,37 +473,37 @@ def transformar_empleados(df_emp, df_area):
     df["Estrato"] = df["_ca_emp"].apply(
         lambda x: _txt(x.get("Estrato Socioeconómico")) if isinstance(x, dict) else None
     )
- 
+
     df["Nombre_Completo"] = (
         df["first_name"].fillna("") + " " +
         df["surname"].fillna("") + " " +
         df["second_surname"].fillna("")
     ).str.upper().str.strip().str.replace(r"\s+", " ", regex=True)
     df["Genero"] = df["gender"].map({"M": "Masculino", "F": "Femenino"}).fillna("N/A")
- 
+
     # Fechas → tipo date (PostgreSQL)
     df["Fecha_Nacimiento"] = pd.to_datetime(df["birthday"],     errors="coerce").dt.date
     df["Fecha_Ingreso"]    = pd.to_datetime(df["active_since"], errors="coerce").dt.date
- 
+
     # Edad
     hoy = datetime.now().date()
     df["Edad"] = df["Fecha_Nacimiento"].apply(
         lambda b: (hoy - b).days // 365 if pd.notna(b) else None
     )
- 
+
     df_final = df[[
         "document_number", "Nombre_Completo", "Genero", "Fecha_Nacimiento", "Edad",
         "Cargo", "Sede", "Division", "Area", "Sub_Area", "status", "Fecha_Ingreso", "Horario",
         "Escolaridad", "Estrato", "Tipo_Contrato", "Clasificacion"
     ]].copy()
- 
+
     # Renombrar a snake_case (para que coincida con la tabla en Postgres)
     df_final.columns = [
         "documento", "nombre_completo", "genero", "fecha_nacimiento", "edad",
         "cargo", "sede", "division", "area", "sub_area", "estado", "fecha_ingreso", "horario",
         "escolaridad", "estrato", "tipo_contrato", "clasificacion"
     ]
- 
+
     # Deduplicar por documento (por si viene el mismo dos veces)
     df_final = df_final.drop_duplicates(subset=["documento"]).reset_index(drop=True)
     return df_final
@@ -722,25 +722,67 @@ def get_horas_extras_mes(obra_id, ano, mes):
 
 
 def transformar_horas_extras(df_he):
-    """Normaliza las horas extras al esquema Postgres (tabla horas_extras)."""
+    """Normaliza las horas extras al esquema Postgres (tabla horas_extras, 8 conceptos).
+
+    La API `obtenerHorasExtras` devuelve el acumulado del mes por colaborador,
+    desglosado en los 8 conceptos colombianos + total. TODOS los valores vienen
+    en SEGUNDOS (verificado contra la UI de Buk: p.ej. 10800 = 3h, 9000 = 2.5h).
+    Aquí SOLO se renombra y se limpia: la conversión a horas y el cálculo de
+    costo viven en las vistas SQL, nunca en el ETL.
+
+    Alcance (decisión GH, confirmada): la API suma únicamente horas APROBADAS
+    (aprobado + aprobado parcial); las rechazadas llegan en 0. Es exactamente lo
+    que se quiere reportar. `total_horas_extras` = total de segundos aprobados.
+
+    Mapeo concepto API → columna (con su factor de recargo entre paréntesis):
+        Hora Extra Diurna Ordinaria (1.25)                        → he_diurna_ord
+        Hora Extra Nocturna (1.75)                                → he_nocturna
+        Hora Extra Diurna Dominical y Festivos (2.05)             → he_diurna_domfes
+        Hora Extra Nocturna Dominical y Festivos (2.55)           → he_nocturna_domfes
+        Hora Recargo Nocturno (0.35)                              → rec_nocturno
+        Hora Recargo Diurno Dominical y Festivos Habitual (1.80)  → rec_diurno_domfes_hab
+        Hora Recargo Diurno Dominical y Festivos No habitual (0.80)→ rec_diurno_domfes_nohab
+        Hora Recargo Nocturno Dominical y Festivos (1.15)         → rec_nocturno_domfes
+        total_horas_extras                                        → total_segundos
+    """
     if df_he is None or df_he.empty:
         return None
 
     df = df_he.copy()
+
+    # obraId (camelCase) → obra_id. Antes se perdía en silencio porque la tabla
+    # esperaba 'obra_id' pero la API manda 'obraId'.
+    if "obraId" in df.columns and "obra_id" not in df.columns:
+        df = df.rename(columns={"obraId": "obra_id"})
+
+    # Mapa concepto API → columna Postgres (todo en segundos).
     renombrar = {
         "DNI": "dni",
-        "Horas Extras 50%": "he_50",
-        "Horas Extras 100%": "he_100",
-        "total_horas_extras": "total_he",
+        "Hora Extra Diurna Ordinaria (1.25)":                         "he_diurna_ord",
+        "Hora Extra Nocturna (1.75)":                                 "he_nocturna",
+        "Hora Extra Diurna Dominical y Festivos (2.05)":              "he_diurna_domfes",
+        "Hora Extra Nocturna Dominical y Festivos (2.55)":            "he_nocturna_domfes",
+        "Hora Recargo Nocturno (0.35)":                               "rec_nocturno",
+        "Hora Recargo Diurno Dominical y Festivos Habitual (1.80)":   "rec_diurno_domfes_hab",
+        "Hora Recargo Diurno Dominical y Festivos No habitual (0.80)": "rec_diurno_domfes_nohab",
+        "Hora Recargo Nocturno Dominical y Festivos (1.15)":          "rec_nocturno_domfes",
+        "total_horas_extras":                                         "total_segundos",
     }
     df = df.rename(columns={k: v for k, v in renombrar.items() if k in df.columns})
 
     if "dni" in df.columns:
         df["dni"] = df["dni"].astype(str).str.strip()
 
-    for col in ("he_50", "he_100", "total_he"):
+    # Columnas de segundos (enteros). Si alguna faltara en la respuesta → 0,
+    # para no romper la carga (la tabla las tiene NOT NULL DEFAULT 0).
+    cols_segundos = [
+        "he_diurna_ord", "he_nocturna", "he_diurna_domfes", "he_nocturna_domfes",
+        "rec_nocturno", "rec_diurno_domfes_hab", "rec_diurno_domfes_nohab",
+        "rec_nocturno_domfes", "total_segundos",
+    ]
+    for col in cols_segundos:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
         else:
             df[col] = 0
 
@@ -750,7 +792,7 @@ def transformar_horas_extras(df_he):
         df = df.dropna(subset=pk)
         df = df.drop_duplicates(subset=pk).reset_index(drop=True)
 
-    cols = ["obra_id", "dni", "ano", "mes", "he_50", "he_100", "total_he"]
+    cols = ["obra_id", "dni", "ano", "mes"] + cols_segundos
     return df[[c for c in cols if c in df.columns]].copy()
 
 
