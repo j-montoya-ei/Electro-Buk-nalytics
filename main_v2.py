@@ -491,6 +491,15 @@ def transformar_empleados(df_emp, df_area):
         lambda b: (hoy - b).days // 365 if pd.notna(b) else None
     )
 
+    # Documento: normalizar a cédula "pelada" (sin puntos de miles ni espacios).
+    # Buk Core lo entrega formateado (p.ej. "1.117.012.224"), pero el resto de
+    # fuentes (Asistencia: dni en marcas, permisos, horas extras) lo trae sin
+    # formato. Sin esto, ningún JOIN empleados.documento = <dni> cruza.
+    df["document_number"] = (
+        df["document_number"].astype(str)
+        .str.replace(r"[.\s]", "", regex=True)
+    )
+
     df_final = df[[
         "document_number", "Nombre_Completo", "Genero", "Fecha_Nacimiento", "Edad",
         "Cargo", "Sede", "Division", "Area", "Sub_Area", "status", "Fecha_Ingreso", "Horario",
