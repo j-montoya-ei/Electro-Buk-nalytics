@@ -694,7 +694,7 @@ def meses_a_procesar(modo_backfill):
     ano_actual, mes_actual = hoy.year, hoy.month
 
     if modo_backfill:
-        a, m = 2026, 7  # julio 2026: inicio de datos confiables
+        a, m = 2026, 5  # mayo 2026: inicio histórico solicitado
         meses = []
         while (a, m) <= (ano_actual, mes_actual):
             meses.append((a, m))
@@ -875,8 +875,14 @@ def main():
             backfill_forzado = os.getenv("BACKFILL") == "1"
             backfill_auto = tabla_vacia(conn, "asistencias_marcas") or tabla_vacia(conn, "inasistencias")
             modo_backfill = backfill_forzado or backfill_auto
-            dias = config.DIAS_BACKFILL if modo_backfill else config.DIAS_INCREMENTAL
             modo = "BACKFILL" if modo_backfill else "INCREMENTAL"
+
+            if modo_backfill:
+                fecha_desde_backfill = datetime.strptime(config.FECHA_BACKFILL_DESDE, "%Y-%m-%d")
+                fecha_hasta_actual = datetime.now()
+                dias = (fecha_hasta_actual.date() - fecha_desde_backfill.date()).days + 1
+            else:
+                dias = config.DIAS_INCREMENTAL
 
             razon = ("forzado por variable de entorno BACKFILL=1" if backfill_forzado
                      else "tabla vacía detectada" if backfill_auto
@@ -903,7 +909,10 @@ def main():
 
         # ─── Buk Asistencia: marcas + inasistencias + marcas detalle ──────────
         fecha_hasta = datetime.now()
-        fecha_desde = fecha_hasta - timedelta(days=dias)
+        if modo_backfill:
+            fecha_desde = datetime.strptime(config.FECHA_BACKFILL_DESDE, "%Y-%m-%d")
+        else:
+            fecha_desde = fecha_hasta - timedelta(days=dias)
         log.info(f"\n📅 Ventana de asistencia: {fecha_desde:%d-%m-%Y} → {fecha_hasta:%d-%m-%Y}")
 
         marcas_acumuladas, inasist_acumuladas = [], []
