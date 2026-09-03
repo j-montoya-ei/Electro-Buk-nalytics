@@ -7,7 +7,8 @@ Editar aquí cambia el comportamiento sin tocar la lógica.
 # ─── Ventanas de sincronización ──────────────────────────────
 # BACKFILL: cuando la BD está vacía, trae historia larga
 # INCREMENTAL: corridas normales del Task Scheduler / GitHub Actions
-DIAS_BACKFILL    = 55
+FECHA_BACKFILL_DESDE = "2026-05-01"  # inicio histórico solicitado del ETL
+DIAS_BACKFILL    = 55                 # ventana por defecto para la carga inicial histórica
 DIAS_INCREMENTAL = 5
 # ─── HTTP / Reintentos ───────────────────────────────────────
 TIMEOUT_HTTP     = 30        # segundos
